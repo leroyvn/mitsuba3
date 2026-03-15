@@ -33,7 +33,7 @@ include_directories(
   ${RGB2SPEC_INCLUDE_DIRS}
 )
 
-if (NOT MI_ENABLE_EMBREE)
+if (NOT MI_ENABLE_EMBREE AND NOT MI_ENABLE_TINYBVH)
   set(LIBRENDER_EXTRA_SRC kdtree.cpp ${INC_DIR}/kdtree.h ${LIBRENDER_EXTRA_SRC})
 endif()
 

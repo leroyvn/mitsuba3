@@ -156,7 +156,12 @@ public:
         ray.wavelengths = wavelengths;
 
         // 2. Set ray origin and direction
-        Int32 sensor_index(position_sample.x() * m_sensor_count);
+        // Clamp to valid range: sample_ray_differential adds a pixel offset
+        // (+1/width) to compute differentials, which can push position_sample.x()
+        // above 1.0 for the last pixel, causing an out-of-bounds gather.
+        Int32 sensor_index = dr::clip(
+            Int32(position_sample.x() * m_sensor_count),
+            0, Int32(m_sensor_count - 1));
         Index index(sensor_index);
 
         Matrix coefficients =

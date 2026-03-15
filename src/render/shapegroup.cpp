@@ -2,13 +2,20 @@
 #include <mitsuba/render/shapegroup.h>
 #include <mitsuba/render/optix_api.h>
 
+#if defined(MI_ENABLE_TINYBVH)
+// Do NOT define TINYBVH_IMPLEMENTATION here — scene.cpp owns the single
+// translation unit that provides it. We only need the declarations.
+#  include <tiny_bvh.h>
+#  include <mitsuba/render/mesh.h>
+#endif
+
 NAMESPACE_BEGIN(mitsuba)
 
 MI_VARIANT ShapeGroup<Float, Spectrum>::ShapeGroup(const Properties &props)
     : Shape<Float, Spectrum>(props) {
     // ID is now stored in base class JitObject
 
-#if !defined(MI_ENABLE_EMBREE)
+#if !defined(MI_ENABLE_EMBREE) && !defined(MI_ENABLE_TINYBVH)
     if constexpr (!dr::is_cuda_v<Float>)
         m_kdtree = new ShapeKDTree(props);
 #endif
@@ -32,11 +39,11 @@ MI_VARIANT ShapeGroup<Float, Spectrum>::ShapeGroup(const Properties &props)
             m_shapes.push_back(shape);
             shape->mark_as_instance();
 
-#if defined(MI_ENABLE_EMBREE) || defined(MI_ENABLE_CUDA)
+#if defined(MI_ENABLE_EMBREE) || defined(MI_ENABLE_CUDA) || defined(MI_ENABLE_TINYBVH)
             m_bbox.expand(shape->bbox());
 #endif
 
-#if !defined(MI_ENABLE_EMBREE)
+#if !defined(MI_ENABLE_EMBREE) && !defined(MI_ENABLE_TINYBVH)
             if constexpr (!dr::is_cuda_v<Float>)
                 m_kdtree->add_shape(shape);
 #endif
@@ -44,12 +51,103 @@ MI_VARIANT ShapeGroup<Float, Spectrum>::ShapeGroup(const Properties &props)
             m_shape_types |= type;
         }
     }
-#if !defined(MI_ENABLE_EMBREE)
+#if !defined(MI_ENABLE_EMBREE) && !defined(MI_ENABLE_TINYBVH)
     if constexpr (!dr::is_cuda_v<Float>) {
         if (!m_kdtree->ready())
             m_kdtree->build();
 
         m_bbox = m_kdtree->bbox();
+    }
+#endif
+
+#if defined(MI_ENABLE_TINYBVH)
+    if constexpr (!dr::is_cuda_v<Float>) {
+        // Build TinyBVH BLAS over all child shapes.
+        // Meshes contribute their actual triangles; analytic shapes get a
+        // 12-triangle bounding-box proxy (exact re-intersection on hit).
+        if constexpr (std::is_same_v<ScalarFloat, double>) {
+            for (size_t ci = 0; ci < m_shapes.size(); ++ci) {
+                const Base *shape = m_shapes[ci].get();
+                if (shape->is_mesh()) {
+                    const Mesh<Float, Spectrum> *mesh =
+                        static_cast<const Mesh<Float, Spectrum> *>(shape);
+                    const float *vp = mesh->vertex_positions_buffer().data();
+                    uint32_t nf     = (uint32_t) mesh->face_count();
+                    const uint32_t *fi = mesh->faces_buffer().data();
+                    for (uint32_t f = 0; f < nf; ++f) {
+                        uint32_t i0=fi[f*3], i1=fi[f*3+1], i2=fi[f*3+2];
+                        m_bvh_vertices.push_back({(double)vp[i0*3],(double)vp[i0*3+1],(double)vp[i0*3+2]});
+                        m_bvh_vertices.push_back({(double)vp[i1*3],(double)vp[i1*3+1],(double)vp[i1*3+2]});
+                        m_bvh_vertices.push_back({(double)vp[i2*3],(double)vp[i2*3+1],(double)vp[i2*3+2]});
+                        m_bvh_prim_to_shape.push_back((uint32_t)ci);
+                        m_bvh_prim_to_local.push_back(f);
+                        m_bvh_prim_is_mesh.push_back(true);
+                    }
+                } else {
+                    // Inflate degenerate (zero-extent) axes so proxy
+                    // triangles are non-degenerate for BVH traversal.
+                    constexpr double PROXY_INFLATE = 1e-4;
+                    ScalarBoundingBox3f box = shape->bbox();
+                    double mn[3]={box.min.x(),box.min.y(),box.min.z()};
+                    double mx[3]={box.max.x(),box.max.y(),box.max.z()};
+                    for (int k=0;k<3;++k)
+                        if (mx[k]-mn[k]<PROXY_INFLATE){mn[k]-=PROXY_INFLATE*0.5;mx[k]+=PROXY_INFLATE*0.5;}
+                    tinybvh::bvhdbl3 c[8];
+                    for (int k=0;k<8;++k)
+                        c[k]={(k&1)?mx[0]:mn[0],(k&2)?mx[1]:mn[1],(k&4)?mx[2]:mn[2]};
+                    static const int fc[6][4]={{0,1,3,2},{4,6,7,5},{0,4,5,1},{2,3,7,6},{0,2,6,4},{1,5,7,3}};
+                    uint32_t local=0;
+                    for (int f=0;f<6;++f){
+                        m_bvh_vertices.push_back(c[fc[f][0]]);m_bvh_vertices.push_back(c[fc[f][1]]);m_bvh_vertices.push_back(c[fc[f][2]]);
+                        m_bvh_prim_to_shape.push_back((uint32_t)ci);m_bvh_prim_to_local.push_back(local++);m_bvh_prim_is_mesh.push_back(false);
+                        m_bvh_vertices.push_back(c[fc[f][0]]);m_bvh_vertices.push_back(c[fc[f][2]]);m_bvh_vertices.push_back(c[fc[f][3]]);
+                        m_bvh_prim_to_shape.push_back((uint32_t)ci);m_bvh_prim_to_local.push_back(local++);m_bvh_prim_is_mesh.push_back(false);
+                    }
+                }
+            }
+            if (!m_bvh_vertices.empty())
+                m_tinybvh.Build(m_bvh_vertices.data(), (uint64_t)(m_bvh_vertices.size()/3));
+        } else {
+            for (size_t ci = 0; ci < m_shapes.size(); ++ci) {
+                const Base *shape = m_shapes[ci].get();
+                if (shape->is_mesh()) {
+                    const Mesh<Float, Spectrum> *mesh =
+                        static_cast<const Mesh<Float, Spectrum> *>(shape);
+                    const float *vp = mesh->vertex_positions_buffer().data();
+                    uint32_t nf     = (uint32_t) mesh->face_count();
+                    const uint32_t *fi = mesh->faces_buffer().data();
+                    for (uint32_t f = 0; f < nf; ++f) {
+                        uint32_t i0=fi[f*3], i1=fi[f*3+1], i2=fi[f*3+2];
+                        m_bvh_vertices.push_back({vp[i0*3],vp[i0*3+1],vp[i0*3+2],0.f});
+                        m_bvh_vertices.push_back({vp[i1*3],vp[i1*3+1],vp[i1*3+2],0.f});
+                        m_bvh_vertices.push_back({vp[i2*3],vp[i2*3+1],vp[i2*3+2],0.f});
+                        m_bvh_prim_to_shape.push_back((uint32_t)ci);
+                        m_bvh_prim_to_local.push_back(f);
+                        m_bvh_prim_is_mesh.push_back(true);
+                    }
+                } else {
+                    constexpr double PROXY_INFLATE = 1e-4;
+                    ScalarBoundingBox3f box = shape->bbox();
+                    double mn[3]={(double)box.min.x(),(double)box.min.y(),(double)box.min.z()};
+                    double mx[3]={(double)box.max.x(),(double)box.max.y(),(double)box.max.z()};
+                    for (int k=0;k<3;++k)
+                        if (mx[k]-mn[k]<PROXY_INFLATE){mn[k]-=PROXY_INFLATE*0.5;mx[k]+=PROXY_INFLATE*0.5;}
+                    tinybvh::bvhvec4 c[8];
+                    for (int k=0;k<8;++k)
+                        c[k]={(float)((k&1)?mx[0]:mn[0]),(float)((k&2)?mx[1]:mn[1]),(float)((k&4)?mx[2]:mn[2]),0.f};
+                    static const int fc[6][4]={{0,1,3,2},{4,6,7,5},{0,4,5,1},{2,3,7,6},{0,2,6,4},{1,5,7,3}};
+                    uint32_t local=0;
+                    for (int f=0;f<6;++f){
+                        m_bvh_vertices.push_back(c[fc[f][0]]);m_bvh_vertices.push_back(c[fc[f][1]]);m_bvh_vertices.push_back(c[fc[f][2]]);
+                        m_bvh_prim_to_shape.push_back((uint32_t)ci);m_bvh_prim_to_local.push_back(local++);m_bvh_prim_is_mesh.push_back(false);
+                        m_bvh_vertices.push_back(c[fc[f][0]]);m_bvh_vertices.push_back(c[fc[f][2]]);m_bvh_vertices.push_back(c[fc[f][3]]);
+                        m_bvh_prim_to_shape.push_back((uint32_t)ci);m_bvh_prim_to_local.push_back(local++);m_bvh_prim_is_mesh.push_back(false);
+                    }
+                }
+            }
+            if (!m_bvh_vertices.empty())
+                m_tinybvh.Build(m_bvh_vertices.data(), (uint32_t)(m_bvh_vertices.size()/3));
+        }
     }
 #endif
 
@@ -141,7 +239,7 @@ ShapeGroup<Float, Spectrum>::compute_surface_interaction(const Ray3f &ray,
 
 MI_VARIANT typename ShapeGroup<Float, Spectrum>::ScalarSize
 ShapeGroup<Float, Spectrum>::primitive_count() const {
-#if !defined(MI_ENABLE_EMBREE)
+#if !defined(MI_ENABLE_EMBREE) && !defined(MI_ENABLE_TINYBVH)
     if constexpr (!dr::is_cuda_v<Float>)
         return m_kdtree->primitive_count();
 #endif
@@ -232,13 +330,87 @@ std::tuple<typename ShapeGroup<Float, Spectrum>::ScalarFloat,
            typename ShapeGroup<Float, Spectrum>::ScalarUInt32,
            typename ShapeGroup<Float, Spectrum>::ScalarUInt32>
 ShapeGroup<Float, Spectrum>::ray_intersect_preliminary_scalar(const ScalarRay3f &ray) const {
+#if defined(MI_ENABLE_TINYBVH)
+    ScalarFloat hit_t   = ray.maxt;
+    ScalarPoint2f hit_uv(0.f, 0.f);
+    uint32_t hit_shape = (uint32_t) -1;
+    uint32_t hit_prim  = (uint32_t) -1;
+
+    if constexpr (std::is_same_v<ScalarFloat, double>) {
+        tinybvh::RayEx tbvh_ray(
+            tinybvh::bvhdbl3(ray.o.x(), ray.o.y(), ray.o.z()),
+            tinybvh::bvhdbl3(ray.d.x(), ray.d.y(), ray.d.z()),
+            (double) ray.maxt);
+        m_tinybvh.Intersect(tbvh_ray);
+        if (tbvh_ray.hit.t < (double) ray.maxt) {
+            uint32_t p = (uint32_t) tbvh_ray.hit.prim;
+            if (!m_bvh_prim_is_mesh[p]) {
+                // Analytic child shape: exact re-intersection
+                auto [e_t, e_uv, e_prim, e_inst] =
+                    m_shapes[m_bvh_prim_to_shape[p]]->ray_intersect_preliminary_scalar(ray);
+                if (e_t < ray.maxt) {
+                    hit_t = e_t; hit_uv = e_uv;
+                    hit_shape = m_bvh_prim_to_shape[p]; hit_prim = e_prim;
+                    (void) e_inst;
+                }
+            } else {
+                hit_t = (ScalarFloat) tbvh_ray.hit.t;
+                hit_uv = ScalarPoint2f((ScalarFloat)tbvh_ray.hit.u, (ScalarFloat)tbvh_ray.hit.v);
+                hit_shape = m_bvh_prim_to_shape[p];
+                hit_prim  = m_bvh_prim_to_local[p];
+            }
+        }
+    } else {
+        tinybvh::Ray tbvh_ray(
+            tinybvh::bvhvec3((float)ray.o.x(), (float)ray.o.y(), (float)ray.o.z()),
+            tinybvh::bvhvec3((float)ray.d.x(), (float)ray.d.y(), (float)ray.d.z()),
+            (float) ray.maxt);
+        m_tinybvh.Intersect(tbvh_ray);
+        if (tbvh_ray.hit.t < (float) ray.maxt) {
+            uint32_t p = tbvh_ray.hit.prim;
+            if (!m_bvh_prim_is_mesh[p]) {
+                auto [e_t, e_uv, e_prim, e_inst] =
+                    m_shapes[m_bvh_prim_to_shape[p]]->ray_intersect_preliminary_scalar(ray);
+                if (e_t < ray.maxt) {
+                    hit_t = e_t; hit_uv = e_uv;
+                    hit_shape = m_bvh_prim_to_shape[p]; hit_prim = e_prim;
+                    (void) e_inst;
+                }
+            } else {
+                hit_t = (ScalarFloat) tbvh_ray.hit.t;
+                hit_uv = ScalarPoint2f((ScalarFloat)tbvh_ray.hit.u, (ScalarFloat)tbvh_ray.hit.v);
+                hit_shape = m_bvh_prim_to_shape[p];
+                hit_prim  = m_bvh_prim_to_local[p];
+            }
+        }
+    }
+
+    return { hit_t, hit_uv, hit_shape, hit_prim };
+#else
     auto pi = m_kdtree->template ray_intersect_scalar<false>(ray);
     return { pi.t, pi.prim_uv, pi.shape_index, pi.prim_index };
+#endif
 }
 
 MI_VARIANT
 bool ShapeGroup<Float, Spectrum>::ray_test_scalar(const ScalarRay3f &ray) const {
+#if defined(MI_ENABLE_TINYBVH)
+    if constexpr (std::is_same_v<ScalarFloat, double>) {
+        tinybvh::RayEx tbvh_ray(
+            tinybvh::bvhdbl3(ray.o.x(), ray.o.y(), ray.o.z()),
+            tinybvh::bvhdbl3(ray.d.x(), ray.d.y(), ray.d.z()),
+            (double) ray.maxt);
+        return m_tinybvh.IsOccluded(tbvh_ray);
+    } else {
+        tinybvh::Ray tbvh_ray(
+            tinybvh::bvhvec3((float)ray.o.x(), (float)ray.o.y(), (float)ray.o.z()),
+            tinybvh::bvhvec3((float)ray.d.x(), (float)ray.d.y(), (float)ray.d.z()),
+            (float) ray.maxt);
+        return m_tinybvh.IsOccluded(tbvh_ray);
+    }
+#else
     return m_kdtree->template ray_intersect_scalar<true>(ray).is_valid();
+#endif
 }
 #endif
 

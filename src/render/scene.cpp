@@ -8,6 +8,8 @@
 
 #if defined(MI_ENABLE_EMBREE)
 #  include "scene_embree.inl"
+#elif defined(MI_ENABLE_TINYBVH)
+#  include "scene_tinybvh.inl"
 #else
 #  include <mitsuba/render/kdtree.h>
 #  include "scene_native.inl"
@@ -241,7 +243,7 @@ MI_VARIANT typename Scene<Float, Spectrum>::SurfaceInteraction3f
 Scene<Float, Spectrum>::ray_intersect_naive(const Ray3f &ray, Mask active) const {
     MI_MASKED_FUNCTION(ProfilerPhase::RayIntersect, active);
 
-#if !defined(MI_ENABLE_EMBREE)
+#if !defined(MI_ENABLE_EMBREE) && !defined(MI_ENABLE_TINYBVH)
     if constexpr (!dr::is_cuda_v<Float>)
         return ray_intersect_naive_cpu(ray, active);
 #endif

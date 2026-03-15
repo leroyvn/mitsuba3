@@ -45,3 +45,6 @@
 [submodule "ext/nanobind"]
 	path = ext/nanobind
 	url = https://github.com/wjakob/nanobind.git
+[submodule "ext/tinybvh"]
+	path = ext/tinybvh
+	url = https://github.com/jbikker/tinybvh

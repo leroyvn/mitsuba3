@@ -4,6 +4,8 @@
 
 #if defined(MI_ENABLE_EMBREE)
 #  include <embree3/rtcore.h>
+#elif defined(MI_ENABLE_TINYBVH)
+#  include <tiny_bvh.h>
 #else
 #  include <mitsuba/render/kdtree.h>
 #endif
@@ -86,6 +88,25 @@ private:
 #if defined(MI_ENABLE_EMBREE)
     RTCScene m_embree_scene = nullptr;
     std::vector<int> m_embree_geometries;
+#elif defined(MI_ENABLE_TINYBVH)
+    // Per-precision BVH type for the group BLAS.
+    // BVH_Double when ScalarFloat==double, BVH otherwise.
+    using BVHType = std::conditional_t<std::is_same_v<ScalarFloat, double>,
+                                       tinybvh::BVH_Double,
+                                       tinybvh::BVH>;
+    BVHType m_tinybvh;
+    // Vertex data that backs m_tinybvh (TinyBVH stores a pointer, not a copy).
+    // Must outlive the BVH object.
+    using BVHVertexType = std::conditional_t<std::is_same_v<ScalarFloat, double>,
+                                             tinybvh::bvhdbl3,
+                                             tinybvh::bvhvec4>;
+    std::vector<BVHVertexType> m_bvh_vertices;
+    // Maps BVH prim index → child shape index within m_shapes
+    std::vector<uint32_t> m_bvh_prim_to_shape;
+    // Maps BVH prim index → prim-local index within that child shape
+    std::vector<uint32_t> m_bvh_prim_to_local;
+    // true = mesh triangle; false = bbox proxy for analytic shape
+    std::vector<bool>     m_bvh_prim_is_mesh;
 #else
     ref<ShapeKDTree> m_kdtree;
 #endif

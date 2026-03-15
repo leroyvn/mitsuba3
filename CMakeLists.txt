@@ -26,6 +26,19 @@ option(MI_ENABLE_PYTHON "Build Python bindings for Mitsuba, Dr.Jit, and NanoGUI?
 # option(MI_ENABLE_EMBREE  "Use Embree for ray tracing operations?" ON)
 option(MI_ENABLE_EMBREE  "Use Embree for ray tracing operations?" OFF)
 
+# TinyBVH is a header-only BVH library that can replace both the built-in
+# k-d tree and Embree. It supports both single and double precision.
+option(MI_ENABLE_TINYBVH "Use TinyBVH for ray tracing operations?" OFF)
+
+if (MI_ENABLE_TINYBVH)
+    if (MI_ENABLE_EMBREE)
+        message(FATAL_ERROR "MI_ENABLE_TINYBVH and MI_ENABLE_EMBREE are mutually exclusive.")
+    endif()
+    add_definitions(-DMI_ENABLE_TINYBVH=1)
+    include_directories(${CMAKE_SOURCE_DIR}/ext/tinybvh)
+    message(STATUS "Mitsuba: using TinyBVH for CPU ray tracing.")
+endif()
+
 # Use GCC/Clang address sanitizer?
 # NOTE: To use this in conjunction with Python plugin, you will need to call
 # On OSX:
